@@ -1244,6 +1244,105 @@ double ionosphericDelay(const ionoutc_t *ionoutc, gpstime_t g, double *llh, doub
 	return (iono_delay);
 }
 
+struct Calibration{
+    double sim_clock_bias_ns;
+    double receiver_clock_bias_ns;
+    double sim_clock_drift_ns;
+	double doppler_offset_meters_per_second;
+	double current_cable_delay_m;
+};
+struct Calibration calibration = { .sim_clock_bias_ns=0.0, .receiver_clock_bias_ns=0.0, .sim_clock_drift_ns=-13.95, .doppler_offset_meters_per_second=0.0 };
+
+//void computeRange2(channel_t *chan, xyz_pos& xyz, gpstime_t* time)
+void computeRange2(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, double xyz[])
+{
+	double pos[3],vel[3],clk[2];
+	double los[3];
+	double tau;
+	double range, rate;
+	double xrot,yrot;
+
+	double llh[3],neu[3];
+	double tmat[3][3];
+
+	// SV position at time of the pseudorange observation.
+	satpos(eph, g, pos, vel, clk);
+
+	// Subtract receiver position from satellite position to get the line of sight vector.
+	subVect(los, pos, xyz);
+
+	// Calculate magnitude of range vector, then divide by speed of light
+	// to get the signal travel time
+	tau = normVect(los)/SPEED_OF_LIGHT;
+
+	// Extrapolate the satellite position backwards to the transmission time.
+	// Basically, take the calculated velocity vectors and move a bit further back
+	// by the signal travel time
+	pos[0] -= vel[0]*tau;
+	pos[1] -= vel[1]*tau;
+	pos[2] -= vel[2]*tau;
+
+	// Earth rotation correction. When the signal was sent, the earth rotated by
+	// this much. Add this rotation distance to further correct for satellite position.
+	xrot = pos[0] + pos[1]*OMEGA_EARTH*tau;
+	yrot = pos[1] - pos[0]*OMEGA_EARTH*tau;
+	pos[0] = xrot;
+	pos[1] = yrot;
+
+	// Given this updated satellite position, again difference with receiver to
+	// get the line of sight vector.
+	subVect(los, pos, xyz);
+
+	// range (in meters)
+	range = normVect(los);
+	rho->d = range;
+
+	// Pseudorange is affected by clock errors.
+	// Subtract satellite clock offset from GNSS time (in seconds) (clk[0])
+	//    - sim clock bias is also subtracted as it's part of the satellite clock offset
+	double clock_error = calibration.sim_clock_bias_ns/1000000000.0 + clk[0];
+
+	// Pseudorange takes into consideration clock errors.
+	rho->range = range - SPEED_OF_LIGHT*clock_error;
+
+	// This value is not used in any calculations. It is simply to display the
+	// receivers computed range accounting for their current clock bias. It's only
+	// used for validating as it would require input to get the current receiver clock
+	// bias at this given time t.
+//	rho.rx_corr_range = rho->range + SPEED_OF_LIGHT*(calibration.receiver_clock_bias_ns/1000000000.0);
+
+	// Save this value for TATT calculations into the range_t struct
+	// (the functions that use range_t might not have access to class variables)
+//	rho.rf_cable_delay_m = calibration.current_cable_delay_m;
+
+	// Relative velocity of SV and receiver.
+	rate = dotProd(vel, los)/range;
+
+	// Satellite clock errors (clk[1] s/s) reduces rate
+	// Treat sim clock errors as if they are satellite clock errors
+	double rate_clock_error = calibration.sim_clock_drift_ns / 1000000000.0 + clk[1];
+
+	//               m/s               *     s/s    => m/s
+	// Doppler is negatively affected by clock errors
+	rho->rate = rate - SPEED_OF_LIGHT * rate_clock_error;
+
+	// Calibration offset is the same as sim clock drift, just in different units.
+	// i.e. a clock drift of 10 ns/s is the same as a doppler offset of ~ 3.3m/s
+	rho->rate += calibration.doppler_offset_meters_per_second;
+
+	// Azimuth and elevation angles.
+	xyz2llh(xyz, llh);
+	ltcmat(llh, tmat);
+	ecef2neu(los, tmat, neu);
+	neu2azel(rho->azel, neu);
+
+	rho->iono_delay = ionosphericDelay(ionoutc, g, llh, rho->azel);
+	rho->range += rho->iono_delay;
+
+	//rho->tropo_delay = tropmodel2(llh, rho->azel);
+	//rho->range += rho->tropo_delay;
+}
+
 /*! \brief Compute range between a satellite and the receiver
  *  \param[out] rho The computed range
  *  \param[in] eph Ephemeris data of the satellite
@@ -1321,7 +1420,7 @@ void computeCodePhase(channel_t *chan, range_t rho1, double dt)
 	double rhorate;
 	
 	// Pseudorange rate.
-	rhorate = (rho1.range - chan->rho0.range)/dt;
+	rhorate = (rho1.range - chan->rho0.range)/dt + 4.5;
 
 	// Carrier and code frequency.
 	chan->f_carr = -rhorate/LAMBDA_L1;
